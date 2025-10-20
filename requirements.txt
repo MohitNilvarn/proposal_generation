@@ -1,0 +1,10 @@
+fastapi
+numpy
+uvicorn
+langchain
+langchain-community
+langchain-openai
+python-dotenv
+chromadb
+PyPDF2
+pydantic
