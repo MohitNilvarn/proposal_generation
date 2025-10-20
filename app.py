@@ -1,5 +1,20 @@
-from fastapi import FastAPI
+"""proposal_api.py
+
+Improved FastAPI app with startup initialization, Chroma persistence,
+safe blocking calls from async endpoints, root redirect and GET /ask help page.
+"""
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
+from dotenv import load_dotenv
+import os
+import logging
+from typing import Optional
+
+# LangChain / vector/LLM imports
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -7,52 +22,34 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-from fastapi.middleware.cors import CORSMiddleware
-import os
-from dotenv import load_dotenv
+
+# Basic logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("proposal-api")
 
 load_dotenv()
 
-# Get API key from environment
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if not openai_api_key:
-    raise ValueError("OPENAI_API_KEY not found in environment variables")
+# -------------------------
+# Config & paths
+# -------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not found in environment variables")
 
-# PDF Path
+# Local PDF and Chroma persistence directory - change if needed
 PDF_PATH = "Proposal/Proposal Knowledge Base (1).pdf"
+CHROMA_PERSIST_DIR = "chroma_db"
 
-# Check if PDF exists
-if not os.path.exists(PDF_PATH):
-    raise FileNotFoundError(f"PDF not found at {PDF_PATH}")
+# Vector / chain globals (populated on startup)
+vector_db: Optional[Chroma] = None
+retriever = None
+rag_chain = None
+llm = None
+prompt = None
 
-print("Loading PDF...")
-loader = PyPDFLoader(PDF_PATH)
-docs = loader.load()
-print(f"Loaded {len(docs)} pages")
-
-# Split documents
-print("Splitting documents...")
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1500,
-    chunk_overlap=250,
-    separators=["\n\n", "\n", ".", "!", "?"]
-)
-splits = text_splitter.split_documents(docs)
-print(f"Created {len(splits)} chunks")
-
-# Create embeddings
-print("Creating embeddings...")
-embeddings = OpenAIEmbeddings(
-    model="text-embedding-3-small",
-    api_key=openai_api_key
-)
-
-# Create Chroma vector database (stored locally)
-print("Building vector database...")
-vector_db = Chroma.from_documents(splits, embedding=embeddings)
-print("Vector database ready")
-
-# Prompt template
+# -------------------------
+# Prompt Template (unchanged logic)
+# -------------------------
 prompt_template = """You are a proposal generation assistant for a software development company. 
 Your task is to create accurate, professional project proposals based ONLY on the information provided in the retrieved context.
 
@@ -98,34 +95,16 @@ prompt = PromptTemplate(
     input_variables=["context", "question"]
 )
 
-# Initialize LLM
-llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0.0,
-    api_key=openai_api_key
-)
-
-# Create RAG chain using LCEL (LangChain Expression Language)
-def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
-
-retriever = vector_db.as_retriever(search_kwargs={"k": 8})
-
-rag_chain = (
-    {"context": retriever | format_docs, "question": RunnablePassthrough()}
-    | prompt
-    | llm
-    | StrOutputParser()
-)
-
+# -------------------------
 # FastAPI app
+# -------------------------
 app = FastAPI(
     title="Proposal Generator",
-    description="Generate project proposals based on knowledge base",
-    version="1.0.0"
+    description="Generate project proposals based on a PDF knowledge base (RAG)",
+    version="1.0.0",
 )
 
-# CORS middleware
+# CORS - adjust origins for production
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -138,25 +117,139 @@ app.add_middleware(
 class Query(BaseModel):
     question: str
 
-# Endpoints
+# -------------------------
+# Utility helpers
+# -------------------------
+def format_docs(docs):
+    """Concatenate retrieved docs into a single context string."""
+    return "\n\n".join(getattr(d, "page_content", str(d)) for d in docs)
+
+# -------------------------
+# Startup: build / load vector DB and chain
+# -------------------------
+@app.on_event("startup")
+def startup_event():
+    global vector_db, retriever, llm, rag_chain, prompt
+
+    # 1) Ensure PDF exists
+    if not os.path.exists(PDF_PATH):
+        logger.error("PDF not found at %s", PDF_PATH)
+        # Raise so that deployments/platforms know startup failed
+        raise FileNotFoundError(f"PDF not found at {PDF_PATH}")
+
+    logger.info("Initializing embeddings and vector DB (this may take a while on first run)...")
+
+    # 2) Create embeddings client
+    embeddings = OpenAIEmbeddings(
+        model="text-embedding-3-small",
+        api_key=OPENAI_API_KEY
+    )
+
+    # 3) If Chroma persisted DB exists, load it. Otherwise build from PDF and persist.
+    try:
+        if os.path.exists(CHROMA_PERSIST_DIR) and os.listdir(CHROMA_PERSIST_DIR):
+            logger.info("Loading persisted Chroma DB from '%s'...", CHROMA_PERSIST_DIR)
+            vector_db = Chroma(persist_directory=CHROMA_PERSIST_DIR, embedding_function=embeddings)
+            logger.info("Loaded persisted Chroma DB.")
+        else:
+            # Load PDF
+            logger.info("Loading PDF from %s", PDF_PATH)
+            loader = PyPDFLoader(PDF_PATH)
+            docs = loader.load()
+            logger.info("Loaded %d pages from PDF", len(docs))
+
+            # Text splitting
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1500,
+                chunk_overlap=250,
+                separators=["\n\n", "\n", ".", "!", "?"]
+            )
+            splits = text_splitter.split_documents(docs)
+            logger.info("Created %d document chunks.", len(splits))
+
+            # Build Chroma and persist
+            logger.info("Building Chroma vector DB (this will call OpenAI embeddings).")
+            vector_db = Chroma.from_documents(splits, embedding=embeddings, persist_directory=CHROMA_PERSIST_DIR)
+            vector_db.persist()
+            logger.info("Chroma DB built and persisted to %s", CHROMA_PERSIST_DIR)
+
+    except Exception as e:
+        logger.exception("Failed to create/load Chroma DB: %s", e)
+        raise
+
+    # 4) Create retriever
+    retriever = vector_db.as_retriever(search_kwargs={"k": 8})
+
+    # 5) Initialize LLM (ChatOpenAI)
+    llm = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0.0,
+        api_key=OPENAI_API_KEY
+    )
+
+    # 6) Build a simple LCEL-style rag chain mapping (keeps your original pattern)
+    # Note: We'll keep the same pipeline shape you had but use it as-is.
+    try:
+        rag_chain = (
+            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+        logger.info("RAG chain initialized.")
+    except Exception:
+        # If building the LCEL pipeline fails, log error but keep app startup to catch issues early.
+        logger.exception("Failed to build RAG chain with LCEL. You may need to adjust pipeline code.")
+        raise
+
+# -------------------------
+# Routes
+# -------------------------
+@app.get("/")
+async def root():
+    """Redirect to /ask (GET). Remove if you don't want automatic redirect."""
+    return RedirectResponse(url="/ask")
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint"""
     return {"status": "healthy", "service": "proposal-generator"}
 
-@app.post("/ask")
-async def ask(query: Query):
-    """Ask a question and get a proposal based on knowledge base"""
-    if not query.question or len(query.question.strip()) == 0:
-        return {"error": "Question cannot be empty"}
-    
-    try:
-        answer = rag_chain.invoke(query.question)
-        return {"answer": answer}
-    except Exception as e:
-        return {"error": f"Error generating proposal: {str(e)}"}
 
-# Run the app
+@app.get("/ask")
+async def ask_get():
+    """Human-friendly GET help for the /ask endpoint"""
+    return {
+        "message": "POST a JSON object to this endpoint with the shape: { 'question': '...' }",
+        "example": {"question": "Create a proposal for X project type from the knowledge base."}
+    }
+
+
+@app.post("/ask")
+async def ask_post(query: Query):
+    """Ask a question and get a proposal based on the knowledge base."""
+    if not query.question or len(query.question.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+    if rag_chain is None:
+        # Defensive: in case startup failed but app is still running
+        raise HTTPException(status_code=500, detail="RAG chain not initialized")
+
+    # The LCEL rag_chain expects an input mapping (we'll pass the question as the input).
+    # Because rag_chain.invoke may be blocking, run it in a threadpool.
+    try:
+        # Provide the question as the input. LCEL pipeline will use retriever|format_docs for 'context'.
+        result = await run_in_threadpool(rag_chain.invoke, {"question": query.question})
+        return {"answer": result}
+    except Exception as e:
+        logger.exception("Error while generating proposal: %s", e)
+        raise HTTPException(status_code=500, detail=f"Error generating proposal: {str(e)}")
+
+# -------------------------
+# Local run (uvicorn)
+# -------------------------
 if __name__ == "__main__":
+    # Note: when running with uvicorn in production, the startup event will be triggered.
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
