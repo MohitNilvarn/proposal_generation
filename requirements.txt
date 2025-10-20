@@ -1,10 +1,11 @@
 fastapi
-numpy
-uvicorn
+pydantic
 langchain
+langchain-core
 langchain-community
 langchain-openai
-python-dotenv
+langchain-text-splitters
 chromadb
-PyPDF2
-pydantic
+pypdf
+python-dotenv
+uvicorn

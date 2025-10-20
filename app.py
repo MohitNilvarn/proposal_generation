@@ -4,9 +4,10 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 from fastapi.middleware.cors import CORSMiddleware
-from langchain.chains import RetrievalQA
 import os
 from dotenv import load_dotenv
 
@@ -104,12 +105,17 @@ llm = ChatOpenAI(
     api_key=openai_api_key
 )
 
-# Create QA chain
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    retriever=vector_db.as_retriever(search_kwargs={"k": 8}),
-    chain_type="stuff",
-    chain_type_kwargs={"prompt": prompt},
+# Create RAG chain using LCEL (LangChain Expression Language)
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
+retriever = vector_db.as_retriever(search_kwargs={"k": 8})
+
+rag_chain = (
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    | prompt
+    | llm
+    | StrOutputParser()
 )
 
 # FastAPI app
@@ -145,7 +151,7 @@ async def ask(query: Query):
         return {"error": "Question cannot be empty"}
     
     try:
-        answer = qa_chain.run(query.question)
+        answer = rag_chain.invoke(query.question)
         return {"answer": answer}
     except Exception as e:
         return {"error": f"Error generating proposal: {str(e)}"}
